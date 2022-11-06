@@ -1,0 +1,197 @@
+#!/bin/bash
+# 
+# Copyright 2022 Lior Okman <lior.okman@gmail.com>
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. Neither the name of the University nor the names of its contributors
+#    may be used to endorse or promote products derived from this software
+#    without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+
+checkDependencies() {
+   if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+	   echo "Your installed bash version is very old ( $BASH_VERSION ). Please update to at least version 4."
+	   exit 1
+   fi
+   local dependencies="gawk sed cut tr openssl cat grep mktemp"
+   for cmd in $dependencies ; do
+	   if ! type -f "$cmd" > /dev/null 2>&1 ; then
+		   echo "Couldn't find '$cmd' on the path. Please install it before using this utility."
+		   exit 1
+	   fi
+   done
+}
+
+generateTOCHash() {
+  local file="$1"
+  cat "$file" | \
+      sed '/^```/,/^```/d' | \
+      grep '^#' | openssl sha256 | cut -f2 -d\ 
+}
+
+readTOCHash() {
+   local file="$1"
+   local hash=$(grep '<!-- TOC hash is %' $file)
+   echo $hash | cut -f2 -d'%'
+}
+
+generateTOC() {
+  local file="$1"
+  local collapse="$2"
+  local withMetadata="$3"
+
+
+  if [ "$collapse" == "yes" ]; then
+     echo "<details>"
+     echo "  <summary>Table of Contents</summary>"
+     echo 
+  else
+     echo Table of Contents
+     echo =================
+     echo
+  fi
+
+  declare -A linkHash=()
+  cat "$file" | \
+      sed '/^```/,/^```/d' | \
+      grep '^#' | \
+      while read level title ; do
+	 # Replace ' ' with '-', transform upper-case to lower-case, and remove any other chars
+         local link="#$(echo $title | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-zA-Z0-9-]//g')"
+	 local times=${linkHash[$link]}
+	 local realLink=$link
+	 if [ -n "$times" ]; then
+	    realLink="${link}-${times}"
+	 else
+	    times="0"
+	 fi
+	 linkHash[$link]="$(( $times + 1 ))"
+	 # Calculate the indentation level
+         local indent=$(echo $level | sed 's^#^  ^g')
+         echo "${indent}* [$title]($realLink)"
+  done
+  echo
+  if [ "$withMetadata" != "no" ] ; then
+     local hash=$(generateTOCHash $file)
+     echo "<!-- TOC generated at $(date) -->"
+     echo "<!-- TOC hash is %$hash% -->"
+     echo
+  fi
+  if [ "$collapse" == "yes" ]; then
+     echo "</details>"
+  fi
+}
+
+replaceInFile() {
+  local file=$1
+  local collapse=$2
+  local force=$3
+
+  local currentHash=$(readTOCHash $file)
+  TOC="<!-- TOC START -->\n$(generateTOC $file $collapse yes)\n<!-- TOC END -->"
+  local newHash=$(echo $TOC | cut -f2 -d'%')
+  if [ "$force" != "yes" -a "$currentHash" == "$newHash" ] ; then
+	  return 
+  fi
+  TMPFILE=$(mktemp tmp.XXXXXXX)
+  if gawk -v RS='<!-- TOC START -->.*<!-- TOC END -->' \
+          -v "TOC=$TOC" \
+          -v ORS= \
+          '1;NR==1{printf "%s", TOC}' \
+          $file > $TMPFILE ; then
+
+          mv $TMPFILE $file
+  else
+          rm $TMPFILE
+  fi
+}
+
+usage() {
+	echo "Usage: $0 [OPTION]... MARKDOWN-FILE"
+	echo "Generates a table of contents for a given markdown file."
+	echo "The file is modified only if the ToC requires updating."
+	echo
+	echo "   -h                Usage information"
+	echo "   -c                Wrap the ToC with a collapsible <details> element"
+	echo "   -a                Add a ToC section to the file if it is missing"
+	echo "   -p                Print to stdout, don't update the file"
+	echo "   -f                Force an update, even if the ToC hash is correct"
+}
+
+################### Main section starts here #####################################
+
+checkDependencies
+
+ADD=
+PRINT_TO_STDOUT=
+COLLAPSE_TOC=no
+FORCE=no
+while getopts "hcapf" options; do
+   case "${options}" in
+      h)
+         usage
+	 exit 0
+	 ;;
+      c)
+	 COLLAPSE_TOC=yes
+         ;;
+      p)
+	 PRINT_TO_STDOUT=yes
+         ;;
+      a)
+	 ADD=yes
+         ;;
+      f)
+         FORCE=yes
+	 ;;
+      *)
+         usage
+	 exit 1
+	 ;;
+   esac
+done
+shift $((OPTIND-1))
+
+FILE="$1"
+if [ -z "$FILE" ]; then
+	echo "Usage: $(basename $0) <file>"
+	exit 1
+fi
+
+if [ -n "$PRINT_TO_STDOUT" ]; then
+   generateTOC $FILE "$COLLAPSE_TOC" no
+else
+   echo -n "Updating $FILE..."
+   if grep -q -e '<!-- TOC START -->' -e '<!-- TOC END -->' $FILE; then
+	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
+	echo "done"
+   elif [ -n "$ADD" ]; then
+	# No TOC placements found, but they should be added
+	sed -i "1s;^;<!-- TOC START -->\n<!-- TOC END -->\n;" $FILE
+	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
+	echo "done"
+   else
+	echo "failed - no TOC delimiters found. Maybe use -a ? "
+	exit 1
+   fi
+fi
+
