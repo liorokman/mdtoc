@@ -29,6 +29,7 @@ Given the following markdown document:
 The following will be generated:
 
 <hr>
+
 Table of Contents
 =================
 
