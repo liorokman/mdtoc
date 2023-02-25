@@ -186,7 +186,7 @@ else
 	echo "done"
    elif [ -n "$ADD" ]; then
 	# No TOC placements found, but they should be added
-	sed -i "1s;^;<!-- TOC START -->\n<!-- TOC END -->\n;" $FILE
+	sed -i "1s;^;<!-- TOC START -->\n<!-- TOC END -->\n\n;" $FILE
 	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
 	echo "done"
    else
