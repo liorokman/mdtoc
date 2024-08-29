@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # 
 # Copyright 2022 Lior Okman <lior.okman@gmail.com>
 # All rights reserved.
@@ -27,31 +27,41 @@
 # OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 # SUCH DAMAGE.
 
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+   echo "Your installed bash version is very old ( $BASH_VERSION ). Please update to at least version 4."
+   exit 1
+fi
+
 checkDependencies() {
-   if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-	   echo "Your installed bash version is very old ( $BASH_VERSION ). Please update to at least version 4."
-	   exit 1
-   fi
-   local dependencies="gawk sed cut tr openssl cat grep mktemp"
+   local dependencies="gawk cut tr openssl cat grep mktemp date"
    for cmd in $dependencies ; do
 	   if ! type -f "$cmd" > /dev/null 2>&1 ; then
 		   echo "Couldn't find '$cmd' on the path. Please install it before using this utility."
 		   exit 1
 	   fi
+       TOOLS[$cmd]=$(type -p "$cmd")
    done
+   if type -f "gsed" > /dev/null 2>&1; then
+       TOOLS["sed"]=$(type -p "gsed")
+   elif type -f "sed" > /dev/null 2>&1; then
+       TOOLS["sed"]=$(type -p "sed")
+   else 
+	   echo "Couldn't find a compatible sed or gsed on the path. Please install it before using this utility."
+	   exit 1
+   fi
 }
 
 generateTOCHash() {
   local file="$1"
   cat "$file" | \
-      sed '/^```/,/^```/d' | \
-      grep '^#' | openssl sha256 | cut -f2 -d\ 
+      ${TOOLS[sed]} '/^```/,/^```/d' | \
+      ${TOOLS[grep]} '^#' | ${TOOLS[openssl]} sha256 | ${TOOLS[cut]} -f2 -d\ 
 }
 
 readTOCHash() {
    local file="$1"
-   local hash=$(grep '<!-- TOC hash is %' $file)
-   echo $hash | cut -f2 -d'%'
+   local hash=$(${TOOLS[grep]} '<!-- TOC hash is %' $file)
+   echo $hash | ${TOOLS[cut]} -f2 -d'%'
 }
 
 generateTOC() {
@@ -71,12 +81,12 @@ generateTOC() {
   fi
 
   declare -A linkHash=()
-  cat "$file" | \
-      sed '/^```/,/^```/d' | \
-      grep '^#' | \
+  ${TOOLS[cat]} "$file" | \
+      ${TOOLS[sed]} '/^```/,/^```/d' | \
+      ${TOOLS[grep]} '^#' | \
       while read level title ; do
 	 # Replace ' ' with '-', transform upper-case to lower-case, and remove any other chars
-         local link="#$(echo $title | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-zA-Z0-9-]//g')"
+         local link="#$(echo $title | ${TOOLS[tr]} '[:upper:] ' '[:lower:]-' | ${TOOLS[sed]} 's/[^a-zA-Z0-9-]//g')"
 	 local times=${linkHash[$link]}
 	 local realLink=$link
 	 if [ -n "$times" ]; then
@@ -86,13 +96,13 @@ generateTOC() {
 	 fi
 	 linkHash[$link]="$(( $times + 1 ))"
 	 # Calculate the indentation level
-         local indent=$(echo $level | sed 's^#^  ^g')
+         local indent=$(echo $level | ${TOOLS[sed]} 's^#^  ^g')
          echo "${indent}* [$title]($realLink)"
   done
   echo
   if [ "$withMetadata" != "no" ] ; then
      local hash=$(generateTOCHash $file)
-     echo "<!-- TOC generated at $(date) -->"
+     echo "<!-- TOC generated at $(${TOOLS[date]}) -->"
      echo "<!-- TOC hash is %$hash% -->"
      echo
   fi
@@ -108,12 +118,12 @@ replaceInFile() {
 
   local currentHash=$(readTOCHash $file)
   TOC="<!-- TOC START -->\n$(generateTOC $file $collapse yes)\n<!-- TOC END -->"
-  local newHash=$(echo $TOC | cut -f2 -d'%')
+  local newHash=$(echo $TOC | ${TOOLS[cut]} -f2 -d'%')
   if [ "$force" != "yes" -a "$currentHash" == "$newHash" ] ; then
 	  return 
   fi
   TMPFILE=$(mktemp tmp.XXXXXXX)
-  if gawk -v RS='<!-- TOC START -->.*<!-- TOC END -->' \
+  if ${TOOLS[gawk]} -v RS='<!-- TOC START -->.*<!-- TOC END -->' \
           -v "TOC=$TOC" \
           -v ORS= \
           '1;NR==1{printf "%s", TOC}' \
@@ -139,6 +149,7 @@ usage() {
 
 ################### Main section starts here #####################################
 
+declare -A TOOLS
 checkDependencies
 
 ADD=
@@ -181,12 +192,12 @@ if [ -n "$PRINT_TO_STDOUT" ]; then
    generateTOC $FILE "$COLLAPSE_TOC" no
 else
    echo -n "Updating $FILE..."
-   if grep -q -e '<!-- TOC START -->' -e '<!-- TOC END -->' $FILE; then
+   if ${TOOLS[grep]} -q -e '<!-- TOC START -->' -e '<!-- TOC END -->' $FILE; then
 	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
 	echo "done"
    elif [ -n "$ADD" ]; then
 	# No TOC placements found, but they should be added
-	sed -i "1s;^;<!-- TOC START -->\n<!-- TOC END -->\n\n;" $FILE
+	${TOOLS[sed]} -i "1s;^;<!-- TOC START -->\n<!-- TOC END -->\n\n;" $FILE
 	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
 	echo "done"
    else
