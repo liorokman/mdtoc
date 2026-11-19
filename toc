@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 
-# Copyright 2022 Lior Okman <lior.okman@gmail.com>
+#
+# Copyright 2022-2026 Lior Okman <lior.okman@gmail.com>
 # All rights reserved.
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
 # are met:
@@ -11,10 +11,10 @@
 # 2. Redistributions in binary form must reproduce the above copyright
 #    notice, this list of conditions and the following disclaimer in the
 #    documentation and/or other materials provided with the distribution.
-# 3. Neither the name of the University nor the names of its contributors
+# 3. Neither the name of the copyright holder nor the names of its contributors
 #    may be used to endorse or promote products derived from this software
 #    without specific prior written permission.
-# 
+#
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS ``AS IS'' AND
 # ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 # IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -27,129 +27,260 @@
 # OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 # SUCH DAMAGE.
 
-if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-   echo "Your installed bash version is very old ( $BASH_VERSION ). Please update to at least version 4."
-   exit 1
-fi
+PROG=$(basename "$0")
 
 checkDependencies() {
-   local dependencies="gawk cut tr openssl cat grep mktemp date"
-   for cmd in $dependencies ; do
-	   if ! type -f "$cmd" > /dev/null 2>&1 ; then
-		   echo "Couldn't find '$cmd' on the path. Please install it before using this utility."
-		   exit 1
-	   fi
-       TOOLS[$cmd]=$(type -p "$cmd")
+   local cmd
+   for cmd in gawk openssl mktemp date cat ; do
+      if ! command -v "$cmd" > /dev/null 2>&1 ; then
+         echo "$PROG: couldn't find '$cmd' on the path. Please install it before using this utility." >&2
+         exit 1
+      fi
    done
-   if type -f "gsed" > /dev/null 2>&1; then
-       TOOLS["sed"]=$(type -p "gsed")
-   elif type -f "sed" > /dev/null 2>&1; then
-       TOOLS["sed"]=$(type -p "sed")
-   else 
-	   echo "Couldn't find a compatible sed or gsed on the path. Please install it before using this utility."
-	   exit 1
-   fi
 }
 
+# Temporary files are removed on exit, whatever the outcome.
+TMPFILES=()
+cleanup() {
+   if [ ${#TMPFILES[@]} -gt 0 ]; then
+      rm -f "${TMPFILES[@]}"
+   fi
+}
+trap cleanup EXIT
+
+newTempFile() {
+   local f
+   f=$(mktemp "${TMPDIR:-/tmp}/toc.XXXXXXX") || exit 1
+   TMPFILES+=("$f")
+   echo "$f"
+}
+
+# Replace the contents of $2 with $1, keeping $2's inode, permissions,
+# ownership, hard links and symlinks intact.
+overwriteFile() {
+   cat "$1" > "$2"
+}
+
+# Matches a line holding only a TOC marker (whitespace and a CR allowed).
+AWK_MARKERS='
+function isStart(s) { return s ~ /^[ \t]*<!-- TOC START -->[ \t]*\r?$/ }
+function isEnd(s)   { return s ~ /^[ \t]*<!-- TOC END -->[ \t]*\r?$/ }
+'
+
+# Prints one ToC line per heading of the given markdown file.
+# shellcheck disable=SC2016  # awk code, not shell expansions
+AWK_HEADINGS='
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+
+# Replace links and images with their text: [text](url) -> text
+function delink(s,   t) {
+   while (match(s, /!?\[[^\]]*\]\([^)]*\)/)) {
+      t = substr(s, RSTART, RLENGTH)
+      sub(/^!?\[/, "", t)
+      sub(/\]\(.*$/, "", t)
+      s = substr(s, 1, RSTART - 1) t substr(s, RSTART + RLENGTH)
+   }
+   return s
+}
+
+# The anchor GitHub generates: lower-case, punctuation other than "-" and
+# "_" removed, and every space replaced with "-".
+function anchor(s,   a) {
+   a = tolower(s)
+   gsub(/[^[:alnum:] _-]/, "", a)
+   gsub(/ /, "-", a)
+   return a
+}
+
+function emit(level, title,   a, real, indent, i) {
+   title = delink(trim(title))
+   if (title == "")
+      return
+   a = anchor(title)
+   if (a in seen) {
+      real = a "-" seen[a]
+      seen[a]++
+   } else {
+      real = a
+      seen[a] = 1
+   }
+   indent = ""
+   for (i = 0; i < level; i++)
+      indent = indent "  "
+   print indent "* [" title "](#" real ")"
+}
+
+{ sub(/\r$/, "") }
+
+# YAML front matter
+NR == 1 && /^---[ \t]*$/ { frontmatter = 1; next }
+frontmatter { if (/^(---|\.\.\.)[ \t]*$/) frontmatter = 0; next }
+
+# Fenced code blocks, opened and closed by ``` or ~~~
+infence {
+   if (/^ {0,3}(`{3,}|~{3,})[ \t]*$/) {
+      f = $0
+      gsub(/[ \t]/, "", f)
+      if (substr(f, 1, 1) == fencechar && length(f) >= fencelen)
+         infence = 0
+   }
+   next
+}
+match($0, /^ {0,3}(`{3,}|~{3,})/) {
+   f = substr($0, RSTART, RLENGTH)
+   gsub(/ /, "", f)
+   fencechar = substr(f, 1, 1)
+   fencelen = length(f)
+   infence = 1
+   para = ""
+   next
+}
+
+# The existing ToC block
+isStart($0) { intoc = 1 }
+intoc { if (isEnd($0)) intoc = 0; para = ""; next }
+
+# ATX headings: "# Title", "## Title ##"
+/^ {0,3}#{1,6}([ \t]|$)/ {
+   line = $0
+   sub(/^ +/, "", line)
+   match(line, /^#+/)
+   level = RLENGTH
+   t = substr(line, level + 1)
+   if (t ~ /^[ \t]*#+[ \t]*$/)
+      t = ""
+   else
+      sub(/[ \t]+#+[ \t]*$/, "", t)
+   emit(level, t)
+   para = ""
+   next
+}
+
+# Setext headings: a paragraph underlined with === or ---
+para != "" && /^ {0,3}=+[ \t]*$/ { emit(1, para); para = ""; next }
+para != "" && /^ {0,3}-+[ \t]*$/ { emit(2, para); para = ""; next }
+
+# Lines that end, or cannot be part of, a paragraph
+/^[ \t]*$/                              { para = ""; next }
+/^ {0,3}([-*_][ \t]*){3,}$/             { para = ""; next }
+/^ {0,3}([-*+]|[0-9]+[.)])([ \t]|$)/    { para = ""; next }
+/^ {0,3}[<>]/                           { para = ""; next }
+para == "" && /^(    |\t)/              { next }
+
+{ t = trim($0); para = (para == "" ? t : para " " t) }
+'
+
+extractHeadings() {
+   gawk "$AWK_MARKERS$AWK_HEADINGS" "$1"
+}
+
+# The hash covers the headings and the ToC style, so a change to either
+# causes the ToC to be regenerated.
 generateTOCHash() {
-  local file="$1"
-  cat "$file" | \
-      ${TOOLS[sed]} '/^```/,/^```/d' | \
-      ${TOOLS[grep]} '^#' | ${TOOLS[openssl]} sha256 | ${TOOLS[cut]} -f2 -d\ 
+   local file="$1"
+   local collapse="$2"
+   { echo "collapse=$collapse"; extractHeadings "$file"; } | openssl sha256 | gawk '{ print $NF }'
 }
 
 readTOCHash() {
-   local file="$1"
-   local hash=$(${TOOLS[grep]} '<!-- TOC hash is %' $file)
-   echo $hash | ${TOOLS[cut]} -f2 -d'%'
+   gawk 'match($0, /<!-- TOC hash is %([0-9a-f]*)% -->/, m) { print m[1]; exit }' "$1"
 }
 
 generateTOC() {
-  local file="$1"
-  local collapse="$2"
-  local withMetadata="$3"
+   local file="$1"
+   local collapse="$2"
+   local withMetadata="$3"
 
+   if [ "$collapse" = "yes" ]; then
+      echo "<details>"
+      echo "  <summary>Table of Contents</summary>"
+      echo
+   else
+      echo "Table of Contents"
+      echo "================="
+      echo
+   fi
 
-  if [ "$collapse" == "yes" ]; then
-     echo "<details>"
-     echo "  <summary>Table of Contents</summary>"
-     echo 
-  else
-     echo Table of Contents
-     echo =================
-     echo
-  fi
+   extractHeadings "$file"
+   echo
 
-  declare -A linkHash=()
-  ${TOOLS[cat]} "$file" | \
-      ${TOOLS[sed]} '/^```/,/^```/d' | \
-      ${TOOLS[grep]} '^#' | \
-      while read level title ; do
-	 # Replace ' ' with '-', transform upper-case to lower-case, and remove any other chars
-         local link="#$(echo $title | ${TOOLS[tr]} '[:upper:] ' '[:lower:]-' | ${TOOLS[sed]} 's/[^a-zA-Z0-9-]//g')"
-	 local times=${linkHash[$link]}
-	 local realLink=$link
-	 if [ -n "$times" ]; then
-	    realLink="${link}-${times}"
-	 else
-	    times="0"
-	 fi
-	 linkHash[$link]="$(( $times + 1 ))"
-	 # Calculate the indentation level
-         local indent=$(echo $level | ${TOOLS[sed]} 's^#^  ^g')
-         echo "${indent}* [$title]($realLink)"
-  done
-  echo
-  if [ "$withMetadata" != "no" ] ; then
-     local hash=$(generateTOCHash $file)
-     echo "<!-- TOC generated at $(${TOOLS[date]}) -->"
-     echo "<!-- TOC hash is %$hash% -->"
-     echo
-  fi
-  if [ "$collapse" == "yes" ]; then
-     echo "</details>"
-  fi
+   if [ "$withMetadata" = "yes" ]; then
+      echo "<!-- TOC generated at $(date) -->"
+      echo "<!-- TOC hash is %$(generateTOCHash "$file" "$collapse")% -->"
+      echo
+   fi
+   if [ "$collapse" = "yes" ]; then
+      echo "</details>"
+   fi
 }
 
+# Prints "none" if the file has no markers, "ok" if it has exactly one
+# START line followed by one END line, or an error message otherwise.
+checkMarkers() {
+   gawk "$AWK_MARKERS"'
+      isStart($0) { starts++; if (!startLine) startLine = NR }
+      isEnd($0)   { ends++;   if (!endLine) endLine = NR }
+      END {
+         if (!starts && !ends)             print "none"
+         else if (starts != 1 || ends != 1) print "expected exactly one <!-- TOC START --> line and one <!-- TOC END --> line, found " starts + 0 " and " ends + 0
+         else if (endLine < startLine)      print "<!-- TOC END --> appears before <!-- TOC START -->"
+         else                               print "ok"
+      }' "$1"
+}
+
+# Adds empty TOC markers at the top of the file, after any front matter.
+addMarkers() {
+   local file="$1"
+   local out
+   out=$(newTempFile)
+   gawk '
+      function markers() { printf "<!-- TOC START -->\n<!-- TOC END -->\n\n"; added = 1 }
+      NR == 1 && /^---[ \t]*\r?$/ { fm = 1; print; next }
+      fm { print; if (/^(---|\.\.\.)[ \t]*\r?$/) { fm = 0; print ""; markers() } next }
+      !added { markers() }
+      { print }
+      END { if (!added) markers() }
+   ' "$file" > "$out" && overwriteFile "$out" "$file"
+}
+
+# Returns 0 if the file was updated, 1 if it was already up to date.
 replaceInFile() {
-  local file=$1
-  local collapse=$2
-  local force=$3
+   local file="$1"
+   local collapse="$2"
+   local force="$3"
+   local tocFile out
 
-  local currentHash=$(readTOCHash $file)
-  TOC="<!-- TOC START -->\n$(generateTOC $file $collapse yes)\n<!-- TOC END -->"
-  local newHash=$(echo $TOC | ${TOOLS[cut]} -f2 -d'%')
-  if [ "$force" != "yes" -a "$currentHash" == "$newHash" ] ; then
-	  return 
-  fi
-  TMPFILE=$(mktemp tmp.XXXXXXX)
-  if ${TOOLS[gawk]} -v RS='<!-- TOC START -->.*<!-- TOC END -->' \
-          -v "TOC=$TOC" \
-          -v ORS= \
-          '1;NR==1{printf "%s", TOC}' \
-          $file > $TMPFILE ; then
+   if [ "$force" != "yes" ] && [ "$(readTOCHash "$file")" = "$(generateTOCHash "$file" "$collapse")" ]; then
+      return 1
+   fi
 
-          mv $TMPFILE $file
-  else
-          rm $TMPFILE
-  fi
+   tocFile=$(newTempFile)
+   out=$(newTempFile)
+   printf '%s\n' "$(generateTOC "$file" "$collapse" yes)" > "$tocFile"
+   gawk "$AWK_MARKERS"'
+      ARGIND == 1 { toc = toc $0 "\n"; next }
+      isStart($0) { print; printf "%s", toc; skipping = 1; next }
+      skipping    { if (isEnd($0)) { print; skipping = 0 } next }
+      { print }
+   ' "$tocFile" "$file" > "$out" || exit 1
+   overwriteFile "$out" "$file" || exit 1
+   return 0
 }
 
 usage() {
-	echo "Usage: $0 [OPTION]... MARKDOWN-FILE"
-	echo "Generates a table of contents for a given markdown file."
-	echo "The file is modified only if the ToC requires updating."
-	echo
-	echo "   -h                Usage information"
-	echo "   -c                Wrap the ToC with a collapsible <details> element"
-	echo "   -a                Add a ToC section to the file if it is missing"
-	echo "   -p                Print to stdout, don't update the file"
-	echo "   -f                Force an update, even if the ToC hash is correct"
+   echo "Usage: $PROG [OPTION]... MARKDOWN-FILE"
+   echo "Generates a table of contents for a given markdown file."
+   echo "The file is modified only if the ToC requires updating."
+   echo
+   echo "   -h                Usage information"
+   echo "   -c                Wrap the ToC with a collapsible <details> element"
+   echo "   -a                Add a ToC section to the file if it is missing"
+   echo "   -p                Print to stdout, don't update the file"
+   echo "   -f                Force an update, even if the ToC hash is correct"
 }
 
 ################### Main section starts here #####################################
 
-declare -A TOOLS
 checkDependencies
 
 ADD=
@@ -158,51 +289,51 @@ COLLAPSE_TOC=no
 FORCE=no
 while getopts "hcapf" options; do
    case "${options}" in
-      h)
-         usage
-	 exit 0
-	 ;;
-      c)
-	 COLLAPSE_TOC=yes
-         ;;
-      p)
-	 PRINT_TO_STDOUT=yes
-         ;;
-      a)
-	 ADD=yes
-         ;;
-      f)
-         FORCE=yes
-	 ;;
-      *)
-         usage
-	 exit 1
-	 ;;
+      h) usage; exit 0 ;;
+      c) COLLAPSE_TOC=yes ;;
+      p) PRINT_TO_STDOUT=yes ;;
+      a) ADD=yes ;;
+      f) FORCE=yes ;;
+      *) usage >&2; exit 1 ;;
    esac
 done
 shift $((OPTIND-1))
 
 FILE="$1"
-if [ -z "$FILE" ]; then
-	echo "Usage: $(basename $0) <file>"
-	exit 1
+if [ -z "$FILE" ] || [ $# -gt 1 ]; then
+   usage >&2
+   exit 1
+fi
+if [ ! -f "$FILE" ]; then
+   echo "$PROG: $FILE: no such file" >&2
+   exit 1
 fi
 
 if [ -n "$PRINT_TO_STDOUT" ]; then
-   generateTOC $FILE "$COLLAPSE_TOC" no
-else
-   echo -n "Updating $FILE..."
-   if ${TOOLS[grep]} -q -e '<!-- TOC START -->' -e '<!-- TOC END -->' $FILE; then
-	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
-	echo "done"
-   elif [ -n "$ADD" ]; then
-	# No TOC placements found, but they should be added
-	${TOOLS[sed]} -i "1s;^;<!-- TOC START -->\n<!-- TOC END -->\n\n;" $FILE
-	replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"
-	echo "done"
-   else
-	echo "failed - no TOC delimiters found. Maybe use -a ? "
-	exit 1
-   fi
+   generateTOC "$FILE" "$COLLAPSE_TOC" no
+   exit 0
 fi
 
+echo -n "Updating $FILE..."
+MARKERS=$(checkMarkers "$FILE")
+case "$MARKERS" in
+   ok)
+      ;;
+   none)
+      if [ -z "$ADD" ]; then
+         echo "failed - no TOC delimiters found. Maybe use -a ?"
+         exit 1
+      fi
+      addMarkers "$FILE" || exit 1
+      ;;
+   *)
+      echo "failed - $MARKERS"
+      exit 1
+      ;;
+esac
+
+if replaceInFile "$FILE" "$COLLAPSE_TOC" "$FORCE"; then
+   echo "done"
+else
+   echo "already up to date"
+fi
